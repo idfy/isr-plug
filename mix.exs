@@ -12,6 +12,7 @@ defmodule ISRPlug.MixProject do
       package: package(),
       # Docs
       name: "ISRPlug",
+      source_url: "https://github.com/idfy/isr-plug",
       docs: [
         main: "ISRPlug",
         extras: ["README.md"]
@@ -37,7 +38,10 @@ defmodule ISRPlug.MixProject do
 
   defp package do
     [
-      maintainers: ["Ziyak Jehangir"]
+      maintainers: ["Ziyak Jehangir"],
+      files: ~w(lib .formatter.exs mix.exs README* LICENSE*),
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/idfy/isr-plug"}
     ]
   end
 end
