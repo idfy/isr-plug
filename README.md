@@ -241,5 +241,5 @@ Contributions are welcome! Please open an issue or submit a pull request. (TODO:
 
 ## License
 
-(TODO: Add License - e.g., MIT License).
+This project is licensed under the Apache 2.0 License - see the LICENSE file for details. (PLEASE VERIFY/CHANGE and add a LICENSE file).
 
