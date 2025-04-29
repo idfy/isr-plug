@@ -32,8 +32,10 @@ defmodule ISRPlug do
   require Logger
 
   @default_ets_table :isr_plug_cache
-  @default_cache_ttl_ms 60_000 # 1 minute
-  @default_stale_serving_ttl_ms 3_600_000 # 1 hour
+  # 1 minute
+  @default_cache_ttl_ms 60_000
+  # 1 hour
+  @default_stale_serving_ttl_ms 3_600_000
 
   @doc """
   Initializes the plug with configuration options.
@@ -89,26 +91,32 @@ defmodule ISRPlug do
     validate_fun!(opts, :apply_fun, 2, "(conn, value)")
 
     # Set defaults and validate optional functions
-    opts = Keyword.put_new_lazy(opts, :extract_data_fun, fn -> fn _conn -> %{} end end)
+    opts = Keyword.put_new(opts, :extract_data_fun, &ISRPlug.default_extract_data/1)
     validate_fun!(opts, :extract_data_fun, 1, "conn")
 
-    opts = Keyword.put_new_lazy(opts, :cache_key_fun, fn -> fn _conn -> :isr_plug_default_key end end)
+    opts = Keyword.put_new(opts, :cache_key_fun, &ISRPlug.default_cache_key/1)
     validate_fun!(opts, :cache_key_fun, 1, "conn")
+
+    opts = Keyword.put_new(opts, :error_handler_fun, &ISRPlug.default_error_handler/2)
+    validate_fun!(opts, :error_handler_fun, 2, "(conn, reason)")
 
     opts = Keyword.put_new(opts, :ets_table, @default_ets_table)
     opts = Keyword.put_new(opts, :cache_ttl_ms, @default_cache_ttl_ms)
     opts = Keyword.put_new(opts, :stale_serving_ttl_ms, @default_stale_serving_ttl_ms)
-
-    opts = Keyword.put_new_lazy(opts, :error_handler_fun, fn -> &default_error_handler/2 end)
-    validate_fun!(opts, :error_handler_fun, 2, "(conn, reason)")
-
 
     # Initialize ETS table if it doesn't exist
     ets_table = opts[:ets_table]
     # Use :named_table property for idempotent creation check
     # Check if the table exists by trying to get info; :undefined means it doesn't exist.
     unless :ets.info(ets_table, :name) == ets_table do
-      :ets.new(ets_table, [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
+      :ets.new(ets_table, [
+        :set,
+        :public,
+        :named_table,
+        read_concurrency: true,
+        write_concurrency: true
+      ])
+
       Logger.info("[#{__MODULE__}] Initialized ETS table: #{inspect(ets_table)}")
     end
 
@@ -143,7 +151,16 @@ defmodule ISRPlug do
     case :ets.lookup(ets_table, cache_key) do
       # Cache Hit
       [{^cache_key, value, expiry_ts, stale_serve_until_ts}] ->
-        handle_cache_hit_and_proceed(conn, log_prefix, value, expiry_ts, stale_serve_until_ts, opts, extracted_data, cache_key)
+        handle_cache_hit_and_proceed(
+          conn,
+          log_prefix,
+          value,
+          expiry_ts,
+          stale_serve_until_ts,
+          opts,
+          extracted_data,
+          cache_key
+        )
 
       # Cache Miss
       [] ->
@@ -153,10 +170,44 @@ defmodule ISRPlug do
     end
   end
 
+  # --- Default Implementation Functions (Need to be public to compile) ---
+
+  @doc """
+  Default function for extracting data. Returns an empty map. Must be public.
+  """
+  def default_extract_data(_conn), do: %{}
+
+  @doc """
+  Default function for generating a cache key. Returns a fixed atom. Must be public.
+  """
+  def default_cache_key(_conn), do: :isr_plug_default_key
+
+  @doc """
+  Default error handler if synchronous fetch fails. Must be public.
+  """
+  def default_error_handler(conn, reason) do
+    log_prefix = "[#{__MODULE__}][DefaultErrorHandler]"
+
+    Logger.error(
+      "#{log_prefix} Synchronous fetch failed: #{inspect(reason)}. Passing connection through unchanged."
+    )
+
+    conn
+  end
+
   # --- Private Processing Logic ---
 
   # Handles the logic when an item is found in the cache
-  defp handle_cache_hit_and_proceed(conn, log_prefix, value, expiry_ts, stale_serve_until_ts, opts, extracted_data, cache_key) do
+  defp handle_cache_hit_and_proceed(
+         conn,
+         log_prefix,
+         value,
+         expiry_ts,
+         stale_serve_until_ts,
+         opts,
+         extracted_data,
+         cache_key
+       ) do
     now = System.monotonic_time()
     apply_fun = opts[:apply_fun]
 
@@ -178,7 +229,18 @@ defmodule ISRPlug do
         fetch_fun = opts[:fetch_fun]
         cache_ttl_ms = opts[:cache_ttl_ms]
         stale_ttl_ms = opts[:stale_serving_ttl_ms]
-        Task.start(fn -> perform_background_refresh(log_prefix, ets_table, fetch_fun, cache_ttl_ms, stale_ttl_ms, extracted_data, cache_key) end)
+
+        Task.start(fn ->
+          perform_background_refresh(
+            log_prefix,
+            ets_table,
+            fetch_fun,
+            cache_ttl_ms,
+            stale_ttl_ms,
+            extracted_data,
+            cache_key
+          )
+        end)
 
         conn_with_stale
 
@@ -199,10 +261,19 @@ defmodule ISRPlug do
     error_handler_fun = opts[:error_handler_fun]
     apply_fun = opts[:apply_fun]
 
-    case fetch_synchronously_and_cache(log_prefix, ets_table, cache_key, fetch_fun, extracted_data, cache_ttl_ms, stale_ttl_ms) do
+    case fetch_synchronously_and_cache(
+           log_prefix,
+           ets_table,
+           cache_key,
+           fetch_fun,
+           extracted_data,
+           cache_ttl_ms,
+           stale_ttl_ms
+         ) do
       {:ok, value} ->
         # Fetched successfully, apply the new value
         apply_value(conn, value, apply_fun)
+
       {:error, reason} ->
         # Sync fetch failed, call the error handler
         Logger.error("#{log_prefix} Synchronous fetch failed: #{inspect(reason)}")
@@ -215,43 +286,74 @@ defmodule ISRPlug do
     if not is_nil(value) do
       apply_fun.(conn, value)
     else
-      Logger.warning("[#{__MODULE__}] No value available to apply (sync fetch likely failed and error handler didn't halt). Passing conn through.")
+      Logger.warning(
+        "[#{__MODULE__}] No value available to apply (sync fetch likely failed and error handler didn't halt). Passing conn through."
+      )
+
       conn
     end
   end
 
   # --- Private Fetching & Caching Helpers ---
 
-  defp fetch_synchronously_and_cache(log_prefix, ets_table, cache_key, fetch_fun, extracted_data, cache_ttl_ms, stale_ttl_ms) do
+  defp fetch_synchronously_and_cache(
+         log_prefix,
+         ets_table,
+         cache_key,
+         fetch_fun,
+         extracted_data,
+         cache_ttl_ms,
+         stale_ttl_ms
+       ) do
     Logger.debug("#{log_prefix} Fetching synchronously...")
+
     case fetch_dynamic_value(log_prefix, fetch_fun, extracted_data) do
       {:ok, value} ->
         update_cache(log_prefix, ets_table, cache_key, value, cache_ttl_ms, stale_ttl_ms)
         {:ok, value}
+
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp perform_background_refresh(log_prefix, ets_table, fetch_fun, cache_ttl_ms, stale_ttl_ms, extracted_data, cache_key) do
+  defp perform_background_refresh(
+         log_prefix,
+         ets_table,
+         fetch_fun,
+         cache_ttl_ms,
+         stale_ttl_ms,
+         extracted_data,
+         cache_key
+       ) do
     Logger.debug("#{log_prefix} Performing background refresh...")
+
     case fetch_dynamic_value(log_prefix, fetch_fun, extracted_data) do
       {:ok, value} ->
         update_cache(log_prefix, ets_table, cache_key, value, cache_ttl_ms, stale_ttl_ms)
         Logger.debug("#{log_prefix} Background refresh successful.")
+
       {:error, reason} ->
         Logger.error("#{log_prefix} Background refresh failed: #{inspect(reason)}")
     end
+
     :ok
   end
 
   defp fetch_dynamic_value(log_prefix, fetch_fun, extracted_data) do
     try do
       case fetch_fun.(extracted_data) do
-        {:ok, value} -> {:ok, value}
-        {:error, reason} -> {:error, reason}
+        {:ok, value} ->
+          {:ok, value}
+
+        {:error, reason} ->
+          {:error, reason}
+
         other ->
-          Logger.warning("#{log_prefix} Fetch function returned unexpected value: #{inspect(other)}. Expected {:ok, value} or {:error, reason}. Treating as error.")
+          Logger.warning(
+            "#{log_prefix} Fetch function returned unexpected value: #{inspect(other)}. Expected {:ok, value} or {:error, reason}. Treating as error."
+          )
+
           {:error, {:unexpected_return, other}}
       end
     rescue
@@ -265,22 +367,18 @@ defmodule ISRPlug do
   defp update_cache(log_prefix, ets_table, cache_key, value, cache_ttl_ms, stale_ttl_ms) do
     now = System.monotonic_time()
     expiry_ts = now + System.convert_time_unit(cache_ttl_ms, :millisecond, :native)
-    stale_serve_until_ts = expiry_ts + System.convert_time_unit(stale_ttl_ms, :millisecond, :native)
+
+    stale_serve_until_ts =
+      expiry_ts + System.convert_time_unit(stale_ttl_ms, :millisecond, :native)
 
     :ets.insert(ets_table, {cache_key, value, expiry_ts, stale_serve_until_ts})
     Logger.debug("#{log_prefix} Updated cache.")
   end
 
-  # Default error handler if synchronous fetch fails
-  defp default_error_handler(conn, reason) do
-    log_prefix = "[#{__MODULE__}][DefaultErrorHandler]"
-    Logger.error("#{log_prefix} Synchronous fetch failed: #{inspect(reason)}. Passing connection through unchanged.")
-    conn
-  end
-
   # Helper for init options validation
   defp validate_fun!(opts, key, arity, signature) do
     fun = Keyword.get(opts, key)
+
     if fun && !is_function(fun, arity) do
       raise ArgumentError, "Option :#{key} must be a function with arity #{arity} #{signature}"
     end
