@@ -10,5 +10,6 @@ table = Application.get_env(:isr_plug, :test_ets_table)
 try do
   :ets.delete(table)
 rescue
-  ArgumentError -> :ok # Table doesn't exist
+  # Table doesn't exist
+  ArgumentError -> :ok
 end

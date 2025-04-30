@@ -7,7 +7,7 @@
 
 It helps improve performance and maintain data freshness by:
 
-*   Serving cached data (fresh or slightly stale) quickly.
+*   Serving cached data (fresh or slightly stale) quickly using an ETS table.
 *   Triggering non-blocking background tasks to refresh expired data.
 *   Allowing flexible, application-specific logic for fetching data and applying it to the `Plug.Conn`.
 
@@ -24,15 +24,65 @@ Add `isr_plug` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:isr_plug, "~> 0.1.0"} # Or use path: {:isr_plug, path: "../path/to/isr_plug"} for local dev
-    # Or git: {:isr_plug, git: "https://github.com/your_github_username/isr_plug.git", tag: "v0.1.0"}
+    {:isr_plug, "~> 0.1.1"} # Check Hex.pm for the latest version
+    # Or use path: {:isr_plug, path: "../path/to/isr_plug"} for local dev
+    # Or git: {:isr_plug, git: "https://github.com/your_github_username/isr_plug.git", tag: "v0.1.1"}
   ]
 end
 ```
 
 Then, run `mix deps.get`.
 
+## Setup: ETS Cache Initialization
+
+`ISRPlug` relies on an ETS table for caching. This table needs to exist when your application starts. The recommended way to manage this is using the included `ISRPlug.CacheManager` GenServer.
+
+1.  **Ensure `ISRPlug.CacheManager` Exists:** If you installed `isr_plug` as a Hex dependency, the `ISRPlug.CacheManager` module is included. If you are using it via a path or copied the code, ensure the `lib/isr_plug/cache_manager.ex` file is present in your project or the dependency path.
+
+2.  **Add `CacheManager` to Your Application Supervisor:** Edit your main application file (e.g., `lib/my_app/application.ex`) and add `ISRPlug.CacheManager` to the list of children started by your supervisor.
+
+    ```elixir
+    # lib/my_app/application.ex
+    defmodule MyApp.Application do
+      use Application
+      require Logger
+
+      @impl true
+      def start(_type, _args) do
+        children = [
+          # ... other children like Repo, Endpoint, PubSub ...
+          MyApp.Repo,
+          MyAppWeb.Endpoint,
+
+          # Add the ISRPlug Cache Manager HERE
+          # This will create the default :isr_plug_cache ETS table on startup.
+          ISRPlug.CacheManager
+
+          # --- OR ---
+
+          # If you need different/multiple ETS tables for ISRPlug:
+          # {ISRPlug.CacheManager, table_names: [:my_isr_cache, :another_isr_cache]}
+
+          # --- OR ---
+
+          # If you need a specific name for the manager process itself (rare):
+          # {ISRPlug.CacheManager, name: MyApp.ISRCacheSupervisor}
+
+        ]
+
+        opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+        Supervisor.start_link(children, opts)
+      end
+
+      # ... config_change etc. ...
+    end
+    ```
+
+    This ensures that the necessary ETS table(s) are created when your application boots and are available for the plug to use.
+
 ## Usage
+
+With the setup complete, you can now use the plug in your application pipelines.
 
 1.  **Define Your Logic Module:** Create a module in your application containing the functions needed by the plug.
 
@@ -48,9 +98,13 @@ Then, run `mix deps.get`.
         tenant_id = extracted_data[:tenant_id]
         Logger.info("Fetching settings for tenant: #{tenant_id}")
         # Simulate fetching from DB or API
-        settings = %{feature_x_enabled: true, theme: "dark"} # Example data
-        {:ok, settings}
-        # Or: {:error, :database_timeout}
+        # In a real app, handle potential errors here
+        case :rand.uniform(5) do
+          1 -> {:error, :simulated_fetch_error}
+          _ ->
+            settings = %{feature_x_enabled: true, theme: "dark", ts: :os.system_time(:millisecond)} # Example data
+            {:ok, settings}
+        end
       end
 
       # --- APPLY FUNCTION ---
@@ -62,99 +116,109 @@ Then, run `mix deps.get`.
 
       # --- (Optional) EXTRACT DATA FUNCTION ---
       # Extracts data needed for fetching from the conn.
-      # Defaults to fn _ -> %{} end.
+      # Defaults to fn _ -> %{} end provided by ISRPlug.default_extract_data/1
       def extract_tenant_id(conn) do
          # Example: Get tenant from subdomain or session
-         %{tenant_id: conn.host |> String.split(".") |> List.first()}
+         %{tenant_id: conn.host |> String.split(".") |> List.first("default")}
       end
 
       # --- (Optional) CACHE KEY FUNCTION ---
       # Generates a unique cache key based on the conn.
-      # Defaults to fn _ -> :isr_plug_default_key end.
+      # Defaults to fn _ -> :isr_plug_default_key end provided by ISRPlug.default_cache_key/1
       # IMPORTANT: Use if fetched data varies per request context (user, tenant, etc.)
       def settings_cache_key(conn) do
-        tenant_id = conn.host |> String.split(".") |> List.first()
-        {:settings, tenant_id}
+        tenant_id = conn.host |> String.split(".") |> List.first("default")
+        {:settings, tenant_id} # Example: Tuple key based on data type and tenant
       end
 
       # --- (Optional) ERROR HANDLER FUNCTION ---
       # Handles errors during *synchronous* fetches (cache miss/expired stale).
       # Receives conn and the error reason. Must return the conn.
-      # Default logs the error and returns the conn unchanged.
+      # Default logs the error and returns the conn unchanged (ISRPlug.default_error_handler/2)
       def handle_fetch_error(conn, reason) do
-        Logger.error("Failed to fetch dynamic settings: #{inspect reason}. Assigning defaults.")
+        tenant_id = conn.host |> String.split(".") |> List.first("default")
+        Logger.error("[DynamicConfig] Failed to fetch settings for #{tenant_id}: #{inspect reason}. Assigning defaults.")
         # Example: Assign default settings or halt
-        Plug.Conn.assign(conn, :dynamic_settings, %{feature_x_enabled: false, theme: "light"})
-        # Or: conn |> Plug.Conn.send_resp(:internal_server_error, "Config error") |> Plug.Conn.halt()
+        Plug.Conn.assign(conn, :dynamic_settings, %{feature_x_enabled: false, theme: "light", error: reason})
+        # Or halt the connection:
+        # conn |> Plug.Conn.send_resp(:internal_server_error, "Config error") |> Plug.Conn.halt()
       end
     end
     ```
 
-2.  **Add the Plug to Your Pipeline:** In your `router.ex` or `endpoint.ex`, add `ISRPlug` with your configuration.
+2.  **Add the Plug to Your Pipeline:** In your `router.ex` or `endpoint.ex`, add `plug ISRPlug` with your configuration.
 
     ```elixir
     # lib/my_app_web/router.ex
     defmodule MyAppWeb.Router do
       use MyAppWeb, :router
-      import ISRPlug # Import to use `plug ISRPlug` directly
+      # No need to import ISRPlug if using explicit module calls
       alias MyApp.DynamicConfig
 
       pipeline :browser do
         plug :accepts, ["html"]
-        # ... other plugs ...
+        # ... other plugs: fetch_session, fetch_live_flash, etc. ...
 
         # Add ISRPlug to fetch dynamic settings
         plug ISRPlug,
+          # Required functions
           fetch_fun: &DynamicConfig.fetch_settings/1,
           apply_fun: &DynamicConfig.apply_settings/2,
-          # Optional functions:
+
+          # Optional functions (use defaults if omitted)
           extract_data_fun: &DynamicConfig.extract_tenant_id/1,
           cache_key_fun: &DynamicConfig.settings_cache_key/1,
           error_handler_fun: &DynamicConfig.handle_fetch_error/2,
-          # Optional configuration:
-          ets_table: :dynamic_settings_cache, # Use a specific ETS table name
-          cache_ttl_ms: :timer.minutes(5),    # Data is fresh for 5 minutes
-          stale_serving_ttl_ms: :timer.hours(1) # Serve stale for 1 hour while refreshing
+
+          # Optional configuration
+          # IMPORTANT: `:ets_table` MUST match a table managed by ISRPlug.CacheManager
+          ets_table: :isr_plug_cache,          # Use the default table name
+          cache_ttl_ms: :timer.seconds(30),    # Data is fresh for 30 seconds
+          stale_serving_ttl_ms: :timer.minutes(5) # Serve stale for 5 min while refreshing
 
         # ... other plugs ...
+        plug :put_root_layout, html: {MyAppWeb.Layouts, :root}
+        plug :protect_from_forgery
+        plug :put_secure_browser_headers
       end
 
       scope "/", MyAppWeb do
-        pipe_through :browser
-        get "/", PageController, :index
+        pipe_through :browser # Use the pipeline where ISRPlug is configured
+
+        get "/", PageController, :home # Example route using the pipeline
       end
     end
     ```
 
-## Configuration Options
+## Configuration Options (for `plug ISRPlug, ...`)
 
 See `ISRPlug.init/1` documentation for details on all options:
 
-*   `:fetch_fun` (**required**)
-*   `:apply_fun` (**required**)
-*   `:extract_data_fun` (*optional*)
-*   `:cache_key_fun` (*optional*)
-*   `:ets_table` (*optional*, defaults to `:isr_plug_cache`)
-*   `:cache_ttl_ms` (*optional*, defaults to 1 minute)
-*   `:stale_serving_ttl_ms` (*optional*, defaults to 1 hour)
-*   `:error_handler_fun` (*optional*)
+*   `:fetch_fun` (**required**): `(extracted_data :: any()) -> {:ok, value :: any()} | {:error, reason :: any()}`
+*   `:apply_fun` (**required**): `(conn :: Plug.Conn.t(), value :: any()) -> Plug.Conn.t()`
+*   `:extract_data_fun` (*optional*, defaults to `&ISRPlug.default_extract_data/1`): `(conn :: Plug.Conn.t()) -> any()`
+*   `:cache_key_fun` (*optional*, defaults to `&ISRPlug.default_cache_key/1`): `(conn :: Plug.Conn.t()) -> term()`
+*   `:ets_table` (*optional*, defaults to `:isr_plug_cache`): `atom()`. Must match a table name configured in `ISRPlug.CacheManager`.
+*   `:cache_ttl_ms` (*optional*, defaults to 60_000 ms): `non_neg_integer()`
+*   `:stale_serving_ttl_ms` (*optional*, defaults to 3_600_000 ms): `non_neg_integer()`
+*   `:error_handler_fun` (*optional*, defaults to `&ISRPlug.default_error_handler/2`): `(conn :: Plug.Conn.t(), reason :: any()) -> Plug.Conn.t()`
 
 ## How it Works
 
 1.  On request, `extract_data_fun` runs, then `cache_key_fun` determines the ETS cache key.
-2.  The ETS table (`:ets_table`) is checked for the key.
-3.  **Cache Hit (Fresh):** If data exists and hasn't passed `cache_ttl_ms`, `apply_fun` runs with the cached value.
-4.  **Cache Hit (Stale):** If data exists, passed `cache_ttl_ms`, but *not* `stale_serving_ttl_ms`, `apply_fun` runs with the *stale* cached value, AND a non-blocking `Task` starts in the background to call `fetch_fun` and update the cache.
-5.  **Cache Miss / Too Stale:** If no data exists, or it passed `stale_serving_ttl_ms`, `fetch_fun` runs *synchronously*.
+2.  The ETS table (specified by `:ets_table`, created by `ISRPlug.CacheManager`) is checked for the key.
+3.  **Cache Hit (Fresh):** If data exists and its timestamp is within `cache_ttl_ms`, `apply_fun` runs with the cached value.
+4.  **Cache Hit (Stale):** If data exists, its timestamp is older than `cache_ttl_ms`, but *newer* than `cache_ttl_ms + stale_serving_ttl_ms`, `apply_fun` runs with the *stale* cached value, AND a non-blocking `Task` starts in the background to call `fetch_fun` and update the cache.
+5.  **Cache Miss / Too Stale:** If no data exists, or its timestamp is older than `cache_ttl_ms + stale_serving_ttl_ms`, `fetch_fun` runs *synchronously* in the current request process.
     *   **Success:** The result is cached, and `apply_fun` runs with the new value.
-    *   **Failure:** `error_handler_fun` runs. The default handler logs the error and passes the connection through; `apply_fun` is *not* called.
+    *   **Failure:** `error_handler_fun` runs. The default handler logs the error and passes the connection through; `apply_fun` is *not* called unless the error handler modifies the `conn` in a way that implies success or provides default data.
 6.  The potentially modified connection is passed to the next plug.
 
 ## Testing the Plug
 
-### Running Unit Tests
+### Running Library Unit Tests
 
-The library includes unit tests. Clone the repository and run:
+If you have cloned the `isr_plug` repository itself:
 
 ```bash
 mix deps.get
@@ -163,25 +227,26 @@ mix test
 
 ### Testing Integration in Your Application (Development)
 
-1.  **Add as Path Dependency:** In your *consuming application's* `mix.exs`, add `isr_plug` using a path dependency:
+1.  **Ensure Setup:** Make sure you have followed the [Setup](#setup-ets-cache-initialization) steps to add `ISRPlug.CacheManager` to your application's supervisor in the `test` environment as well (usually handled by `application.ex` unless you have complex test setup).
+2.  **Add as Path Dependency (Optional):** If developing `isr_plug` locally, use a path dependency in your *consuming application's* `mix.exs`:
 
     ```elixir
     # In your Phoenix app's mix.exs
     def deps do
       [
         # ... other deps
-        {:isr_plug, path: "../path/to/your/local/isr_plug/checkout"}
+        {:isr_plug, path: "/path/to/your/local/isr_plug"}
       ]
     end
     ```
+    Run `mix deps.get` in your consuming application.
 
-2.  **Run `mix deps.get`** in your consuming application.
-3.  **Configure the Plug:** Add the plug to your router or endpoint as shown in the [Usage](#usage) section.
-4.  **Observe Logs:** Start your Phoenix server (`mix phx.server`). Make requests to the relevant endpoints. Check your application logs for messages from `[ISRPlug]` indicating cache hits (fresh/stale), misses, synchronous fetches, and background refreshes.
+3.  **Configure the Plug:** Add the plug to your router or endpoint as shown in the [Usage](#usage) section. Use short TTLs (`cache_ttl_ms`, `stale_serving_ttl_ms`) in the `:test` environment config if you need to test expiration behaviour quickly.
+4.  **Observe Logs:** Start your Phoenix server (`mix phx.server`). Make requests to the relevant endpoints. Check your application logs for messages from `[ISRPlug]` indicating cache hits (fresh/stale), misses, synchronous fetches, and background refreshes. Look for the specific `ets_table` and `cache_key` in the log prefix.
 5.  **Verify Behavior:**
-    *   Check if the data applied by your `apply_fun` (e.g., assigns, headers) is present in the `conn` or response.
-    *   Modify the underlying data source that your `fetch_fun` uses. Observe if the application picks up the change after the `cache_ttl_ms` + `stale_serving_ttl_ms` duration (on the next request after that period), or sooner if a background refresh completes after the `cache_ttl_ms`.
-    *   Simulate errors in your `fetch_fun` and verify that your `error_handler_fun` is called correctly during synchronous fetches.
+    *   Check if the data applied by your `apply_fun` (e.g., assigns, headers) is present in the `conn` or response using browser tools or test assertions.
+    *   Modify the underlying data source that your `fetch_fun` uses. Observe if the application picks up the change after the `cache_ttl_ms` duration (on the next request after that period), serving stale data in between (if `stale_serving_ttl_ms` allows). A fully expired item (older than `cache_ttl_ms + stale_serving_ttl_ms`) should trigger a synchronous fetch immediately.
+    *   Simulate errors in your `fetch_fun` and verify that your `error_handler_fun` is called correctly during synchronous fetches (cache misses or expired stale items).
 
 ## Concurrency Considerations and Limitations (ETS Locking)
 
@@ -189,7 +254,7 @@ The current implementation of `ISRPlug` uses ETS for caching. When stale data is
 
 **Potential Issue: Concurrent Background Refreshes**
 
-Phoenix handles requests using multiple concurrent processes. ETS provides shared memory on a single node, and operations like checking the cache or updating it are generally safe. However, there's a subtle **race condition** specifically related to triggering the **background refresh task**:
+Phoenix handles requests using multiple concurrent processes. ETS provides shared memory on a single node. There's a subtle **race condition** specifically related to triggering the **background refresh task**:
 
 1.  **Request A (Process A):** Checks the cache, finds stale data, decides a background refresh is needed.
 2.  **Request B (Process B):** *Almost simultaneously*, checks the cache, finds the *same* stale data, and *also* decides a background refresh is needed.
@@ -205,41 +270,28 @@ This can lead to:
 
 *   Each request runs in its own process.
 *   The sequence "Check Cache -> Decide Refresh -> Start Task" is performed independently by each process.
-*   While ETS operations themselves are fast and reasonably atomic, there's no mechanism *inherent in this Plug's ETS-based approach* to guarantee that only *one* process "wins" the right to start the background task during that tiny window between deciding and acting.
+*   There's no mechanism *inherent in this Plug's ETS-based approach* to guarantee that only *one* process "wins" the right to start the background task during that tiny window.
 
 **Why Locking is NOT Applied to Synchronous Fetches:**
 
-The plug **intentionally does not** attempt to prevent concurrent *synchronous* fetches (when data is missing entirely or too stale). Applying a lock here would mean:
-
-1.  Request A misses the cache and starts a synchronous fetch, acquiring a hypothetical lock.
-2.  Request B also misses the cache but would be *blocked*, waiting for Request A to finish *and* release the lock, even though Request B also needs the data immediately.
-3.  This would significantly slow down responses during cache misses, which is generally undesirable. Allowing concurrent synchronous fetches, while slightly redundant, ensures requests aren't blocked waiting for *other* requests to fetch the same missing data. The first one to finish populates the cache.
+The plug **intentionally does not** attempt to prevent concurrent *synchronous* fetches (when data is missing entirely or too stale). Applying a lock here would mean requests could be blocked waiting for *other* requests to finish fetching the same missing data, significantly slowing down responses during cache misses. Allowing concurrent synchronous fetches ensures requests aren't blocked, and the first one to finish populates the cache.
 
 **Alternative (More Complex) Solution: GenServer Coordinator**
 
-A more robust way to guarantee that only one background refresh task runs at a time (on a single node) involves using a central coordinating process, typically a `GenServer`:
-
-1.  **Coordinator:** A single `GenServer` process manages the state of which cache keys are currently being refreshed.
-2.  **Plug Interaction:** When the `ISRPlug` detects stale data, instead of starting a `Task` directly, it sends a non-blocking message (e.g., `GenServer.cast`) to the Coordinator, requesting a refresh for the specific `cache_key`.
-3.  **Serialized Decision:** The Coordinator processes these requests one by one. It checks its internal state. If a refresh for that key isn't already marked "in progress," it marks it, starts the background `Task`, and configures the Task to notify the Coordinator upon completion (to clear the "in progress" state). If a refresh *is* already marked, the Coordinator simply ignores the duplicate request.
+A more robust way to guarantee only one background refresh task runs at a time (on a single node) involves using a central coordinating process (e.g., a `GenServer`) to manage refresh state. When the plug detects stale data, it would message the coordinator, which would then decide whether to start a *new* task or ignore the request if a refresh is already in progress for that key.
 
 **Why We Didn't Implement the GenServer:**
 
-*   **Increased Complexity:** Requires adding and managing a dedicated GenServer process within your application's supervision tree.
-*   **Potential Bottleneck:** While likely negligible for many use cases, the single GenServer becomes a serialization point for *all* background refresh triggers managed by instances of this plug.
-*   **Added Resource:** Introduces another persistent process to the system.
+*   **Increased Complexity:** Requires adding and managing another dedicated process within your application's supervision tree.
+*   **Potential Bottleneck:** The single GenServer becomes a serialization point for *all* background refresh triggers.
+*   **Simplicity Trade-off:** The current `ISRPlug` implementation prioritizes simplicity and accepts the possibility of occasional redundant *background* refresh tasks. This is often an acceptable trade-off.
 
-**Current Trade-off:**
-
-The current `ISRPlug` implementation prioritizes simplicity and avoids the overhead of a dedicated GenServer coordinator. It accepts the possibility of occasional redundant *background* refresh tasks under high concurrent load on stale keys. This is often an acceptable trade-off, especially if the `:fetch_fun` is reasonably fast and idempotent, and downstream rate limits are not a major concern.
-
-If absolute prevention of concurrent background refreshes is critical for your specific use case (e.g., very expensive fetches, strict rate limits), consider implementing a custom solution using the GenServer coordinator pattern described above.
+If absolute prevention of concurrent background refreshes is critical, consider implementing a custom solution using the GenServer coordinator pattern.
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request. (TODO: Add contribution guidelines).
+Contributions are welcome! Please open an issue to discuss potential changes or submit a pull request with tests.
 
 ## License
 
-This project is licensed under the Apache 2.0 License - see the LICENSE file for details. (PLEASE VERIFY/CHANGE and add a LICENSE file).
-
+This project is licensed under the Apache 2.0 License.

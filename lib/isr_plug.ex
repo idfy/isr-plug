@@ -1,4 +1,11 @@
 defmodule ISRPlug do
+  # --- Defaults ---
+  @default_ets_table :isr_plug_cache
+  # 1 minute
+  @default_cache_ttl_ms 60_000
+  # 1 hour
+  @default_stale_serving_ttl_ms 3_600_000
+
   @moduledoc """
   A generic Plug implementing an Incremental Static Regeneration (ISR) pattern.
 
@@ -6,91 +13,122 @@ defmodule ISRPlug do
   non-blocking background tasks to refresh expired data. It's designed to be
   flexible and reusable in Phoenix applications.
 
-  ## Configuration
+  ## Setup
+
+  1.  **Add Cache Manager to Supervisor:** Ensure the ETS cache table exists
+      when your application starts by adding `ISRPlug.CacheManager` to your
+      application's supervision tree (`lib/my_app/application.ex`):
+
+      ```elixir
+      # lib/my_app/application.ex
+      def start(_type, _args) do
+        children = [
+          # ... other children
+          MyApp.Repo,
+          MyAppWeb.Endpoint,
+
+          # Add the cache manager. Creates :isr_plug_cache by default.
+          ISRPlug.CacheManager
+          # OR: Specify custom/multiple tables if needed
+          # {ISRPlug.CacheManager, table_names: [:my_isr_cache, :another_cache]}
+        ]
+
+        opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+        Supervisor.start_link(children, opts)
+      end
+      ```
+
+      You need to create the `lib/isr_plug/cache_manager.ex` file (provided in the previous explanation)
+      or ensure it's part of the dependency package if this Plug is distributed.
+
+  2.  **Use the Plug:** Add `plug ISRPlug` in your router pipeline, configuring
+      it with your functions and ensuring the `:ets_table` option matches a
+      table name managed by `ISRPlug.CacheManager`.
+
+      ```elixir
+      # In your router.ex
+      pipeline :isr_protected do
+        plug :accepts, ["html"]
+        # ... other plugs
+        plug ISRPlug,
+          fetch_fun: &MyData.fetch_live_data/1,
+          apply_fun: &MyPageController.apply_data_to_conn/2,
+          cache_key_fun: &MyPageController.generate_cache_key/1,
+          ets_table: :isr_plug_cache # Must match a table from CacheManager
+          # ... other options like cache_ttl_ms, etc.
+      end
+      ```
+
+  ## Configuration Options (for the `plug` call)
 
   The plug is configured via options passed during the `plug` call in the router:
 
-  ```elixir
-  plug ISRPlug,
-    # --- Required ---
-    fetch_fun: &YourModule.your_fetch_function/1,
-    apply_fun: &YourModule.your_apply_function/2,
-
-    # --- Optional ---
-    extract_data_fun: &YourModule.your_extract_function/1,
-    cache_key_fun: &YourModule.your_cache_key_function/1,
-    ets_table: :my_specific_isr_cache,
-    cache_ttl_ms: 60_000, # 1 minute
-    stale_serving_ttl_ms: 3_600_000, # 1 hour
-    error_handler_fun: &YourModule.your_error_handler/2
-  ```
-
-  See the function documentation for `init/1` for details on each option.
-  """
-
-  @behaviour Plug
-  require Logger
-
-  @default_ets_table :isr_plug_cache
-  # 1 minute
-  @default_cache_ttl_ms 60_000
-  # 1 hour
-  @default_stale_serving_ttl_ms 3_600_000
-
-  @doc """
-  Initializes the plug with configuration options.
-
-  ## Options
-
-    * `:fetch_fun` (**required**): A 1-arity function
+  *   `:fetch_fun` (**required**): A 1-arity function
       `(extracted_data :: any()) -> {:ok, value :: any()} | {:error, reason :: any()}`.
       Performs the data retrieval.
 
-    * `:apply_fun` (**required**): A 2-arity function
+  *   `:apply_fun` (**required**): A 2-arity function
       `(conn :: Plug.Conn.t(), value :: any()) -> Plug.Conn.t()`.
       Applies the successfully retrieved `value` (fresh or stale) to the connection.
       Must return a `Plug.Conn.t()`.
 
-    * `:extract_data_fun` (*optional*): A 1-arity function
+  *   `:extract_data_fun` (*optional*): A 1-arity function
       `(conn :: Plug.Conn.t()) -> any()`.
       Extracts necessary data from the `conn` to be passed to `:fetch_fun`.
       Defaults to `fn _conn -> %{} end`.
 
-    * `:cache_key_fun` (*optional*): A 1-arity function
+  *   `:cache_key_fun` (*optional*): A 1-arity function
       `(conn :: Plug.Conn.t()) -> term()`.
       Generates a unique ETS key based on the connection.
       Defaults to `fn _conn -> :isr_plug_default_key end`. Ensure this generates
       distinct keys if the fetched data varies based on connection properties.
 
-    * `:ets_table` (*optional*): Atom name for the ETS table.
-      Defaults to `#{@default_ets_table}`. Use distinct names if using the plug
-      multiple times for different purposes.
+  *   `:ets_table` (*optional*): Atom name for the ETS table.
+      Defaults to `#{@default_ets_table}`. Must match a name managed by `ISRPlug.CacheManager`.
+      Use distinct names if using the plug multiple times for different purposes.
 
-    * `:cache_ttl_ms` (*optional*): Integer milliseconds for how long data is
+  *   `:cache_ttl_ms` (*optional*): Integer milliseconds for how long data is
       considered fresh. Defaults to `#{@default_cache_ttl_ms}` (1 minute).
 
-    * `:stale_serving_ttl_ms` (*optional*): Integer milliseconds *after* expiry
+  *   `:stale_serving_ttl_ms` (*optional*): Integer milliseconds *after* expiry
       during which stale data can be served while refreshing.
       Defaults to `#{@default_stale_serving_ttl_ms}` (1 hour).
 
-    * `:error_handler_fun` (*optional*): A 2-arity function
+  *   `:error_handler_fun` (*optional*): A 2-arity function
       `(conn :: Plug.Conn.t(), reason :: any()) -> Plug.Conn.t()`.
-      Called only when a *synchronous* fetch fails. Defaults to a function that
-      logs the error and returns the original `conn`.
+      Called only when a *synchronous* fetch fails (cache miss or expired stale TTL).
+      Defaults to a function that logs the error and returns the original `conn`.
 
-  This function also initializes the specified ETS table if it doesn't already exist.
+  """
+
+  @behaviour Plug
+  require Logger
+
+  @doc """
+  Returns the default ETS table name used by ISRPlug.
+  Useful for configuring the default `ISRPlug.CacheManager`.
+  """
+  @spec default_ets_table() :: atom()
+  def default_ets_table, do: @default_ets_table
+
+  @doc """
+  Initializes the plug configuration options.
+
+  NOTE: This function **no longer creates the ETS table**. Ensure the table
+  is created at application startup by adding `ISRPlug.CacheManager`
+  (or your own manager) to your application supervisor.
+
+  This function validates the provided options and sets defaults.
   """
   @impl Plug
   def init(opts) do
-    # Ensure required options are present
+    # --- Option validation and defaulting ---
     Keyword.fetch!(opts, :fetch_fun)
     Keyword.fetch!(opts, :apply_fun)
 
-    # Validate function arities (basic check)
     validate_fun!(opts, :fetch_fun, 1, "extracted_data")
     validate_fun!(opts, :apply_fun, 2, "(conn, value)")
 
-    # Set defaults and validate optional functions
     opts = Keyword.put_new(opts, :extract_data_fun, &ISRPlug.default_extract_data/1)
     validate_fun!(opts, :extract_data_fun, 1, "conn")
 
@@ -103,51 +141,34 @@ defmodule ISRPlug do
     opts = Keyword.put_new(opts, :ets_table, @default_ets_table)
     opts = Keyword.put_new(opts, :cache_ttl_ms, @default_cache_ttl_ms)
     opts = Keyword.put_new(opts, :stale_serving_ttl_ms, @default_stale_serving_ttl_ms)
+    # --- End option validation ---
 
-    # Initialize ETS table if it doesn't exist
-    ets_table = opts[:ets_table]
-    # Use :named_table property for idempotent creation check
-    # Check if the table exists by trying to get info; :undefined means it doesn't exist.
-    unless :ets.info(ets_table, :name) == ets_table do
-      :ets.new(ets_table, [
-        :set,
-        :public,
-        :named_table,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
-
-      Logger.info("[#{__MODULE__}] Initialized ETS table: #{inspect(ets_table)}")
-    end
-
+    # Return the validated/defaulted options
     opts
   end
 
   @doc """
   Processes the connection according to the ISR logic.
 
-  1. Extracts data and determines the cache key using configured functions.
-  2. Checks the ETS cache.
-  3. Handles cache hits (fresh or stale).
-  4. If stale, serves stale data and triggers a background refresh task.
-  5. Handles cache misses or expired stale TTL by fetching synchronously.
-  6. If synchronous fetch fails, calls the error handler.
-  7. If data is available (fresh, stale, or newly fetched), applies it using the configured function.
-  8. Returns the (potentially modified) connection.
+  Assumes the ETS table specified in the `:ets_table` option (passed during `init/1`)
+  already exists, managed externally (e.g., by `ISRPlug.CacheManager`).
   """
   @impl Plug
   def call(conn, opts) do
-    # Extract configuration
+    # Extract configuration needed for this request
     extract_data_fun = opts[:extract_data_fun]
     cache_key_fun = opts[:cache_key_fun]
+    # Reads table name from opts passed by init
     ets_table = opts[:ets_table]
 
     # --- Core ISR Logic ---
     extracted_data = extract_data_fun.(conn)
     cache_key = cache_key_fun.(conn)
-    log_prefix = "[#{__MODULE__}][#{inspect(cache_key)}]"
+    # Include table name in log prefix for clarity when using multiple tables
+    log_prefix = "[#{__MODULE__}][#{inspect(ets_table)}][#{inspect(cache_key)}]"
 
     # 1. Check Cache
+    # This lookup expects the table to exist because CacheManager created it
     case :ets.lookup(ets_table, cache_key) do
       # Cache Hit
       [{^cache_key, value, expiry_ts, stale_serve_until_ts}] ->
@@ -170,20 +191,20 @@ defmodule ISRPlug do
     end
   end
 
-  # --- Default Implementation Functions (Need to be public to compile) ---
+  # --- Default Implementation Functions (Public visibility required for Plug init) ---
 
   @doc """
-  Default function for extracting data. Returns an empty map. Must be public.
+  Default function for extracting data. Returns an empty map.
   """
   def default_extract_data(_conn), do: %{}
 
   @doc """
-  Default function for generating a cache key. Returns a fixed atom. Must be public.
+  Default function for generating a cache key. Returns a fixed atom.
   """
   def default_cache_key(_conn), do: :isr_plug_default_key
 
   @doc """
-  Default error handler if synchronous fetch fails. Must be public.
+  Default error handler if synchronous fetch fails. Logs and passes conn through.
   """
   def default_error_handler(conn, reason) do
     log_prefix = "[#{__MODULE__}][DefaultErrorHandler]"
@@ -224,7 +245,7 @@ defmodule ISRPlug do
         conn_with_stale = apply_value(conn, value, apply_fun)
 
         # Trigger background refresh
-        # Explicitly pass necessary opts to the background task
+        # Pass necessary opts explicitly to the background task
         ets_table = opts[:ets_table]
         fetch_fun = opts[:fetch_fun]
         cache_ttl_ms = opts[:cache_ttl_ms]
@@ -254,6 +275,7 @@ defmodule ISRPlug do
 
   # Handles the logic for synchronous fetching (cache miss or expired stale TTL)
   defp handle_sync_fetch_and_proceed(conn, log_prefix, opts, extracted_data, cache_key) do
+    # Extract necessary options
     ets_table = opts[:ets_table]
     fetch_fun = opts[:fetch_fun]
     cache_ttl_ms = opts[:cache_ttl_ms]
@@ -275,17 +297,18 @@ defmodule ISRPlug do
         apply_value(conn, value, apply_fun)
 
       {:error, reason} ->
-        # Sync fetch failed, call the error handler
+        # Sync fetch failed, call the configured error handler
         Logger.error("#{log_prefix} Synchronous fetch failed: #{inspect(reason)}")
         error_handler_fun.(conn, reason)
     end
   end
 
-  # Applies the value using the configured apply_fun
+  # Applies the value using the configured apply_fun, handling nil values
   defp apply_value(conn, value, apply_fun) do
     if not is_nil(value) do
       apply_fun.(conn, value)
     else
+      # This case might happen if fetch failed and error handler didn't halt/change conn
       Logger.warning(
         "[#{__MODULE__}] No value available to apply (sync fetch likely failed and error handler didn't halt). Passing conn through."
       )
@@ -296,6 +319,7 @@ defmodule ISRPlug do
 
   # --- Private Fetching & Caching Helpers ---
 
+  # Performs a synchronous fetch and updates the cache on success
   defp fetch_synchronously_and_cache(
          log_prefix,
          ets_table,
@@ -313,10 +337,12 @@ defmodule ISRPlug do
         {:ok, value}
 
       {:error, reason} ->
+        # Error already logged by fetch_dynamic_value if needed
         {:error, reason}
     end
   end
 
+  # Performs an asynchronous fetch and updates the cache (called via Task.start)
   defp perform_background_refresh(
          log_prefix,
          ets_table,
@@ -334,12 +360,16 @@ defmodule ISRPlug do
         Logger.debug("#{log_prefix} Background refresh successful.")
 
       {:error, reason} ->
+        # Log the error here as the caller task won't report it directly
         Logger.error("#{log_prefix} Background refresh failed: #{inspect(reason)}")
+        # Optionally: Implement retry or backoff logic here
     end
 
+    # Task completes
     :ok
   end
 
+  # Safely executes the user-provided fetch_fun
   defp fetch_dynamic_value(log_prefix, fetch_fun, extracted_data) do
     try do
       case fetch_fun.(extracted_data) do
@@ -347,9 +377,11 @@ defmodule ISRPlug do
           {:ok, value}
 
         {:error, reason} ->
+          # Propagate known fetch errors
           {:error, reason}
 
         other ->
+          # Handle cases where fetch_fun doesn't return the expected tuple
           Logger.warning(
             "#{log_prefix} Fetch function returned unexpected value: #{inspect(other)}. Expected {:ok, value} or {:error, reason}. Treating as error."
           )
@@ -357,30 +389,51 @@ defmodule ISRPlug do
           {:error, {:unexpected_return, other}}
       end
     rescue
+      # Catch any exceptions during fetch_fun execution
       e ->
         err = Exception.format(:error, e, __STACKTRACE__)
-        Logger.error("#{log_prefix} Unhandled error during fetch_fun execution: #{err}")
-        {:error, {:exception, err}}
+        Logger.error("#{log_prefix} Unhandled exception during fetch_fun execution: #{err}")
+        # Return exception as error reason
+        {:error, {:exception, e}}
     end
   end
 
+  # Updates the ETS cache with the new value and calculated timestamps
   defp update_cache(log_prefix, ets_table, cache_key, value, cache_ttl_ms, stale_ttl_ms) do
     now = System.monotonic_time()
+    # Calculate expiry timestamp based on monotonic time + TTL
     expiry_ts = now + System.convert_time_unit(cache_ttl_ms, :millisecond, :native)
 
+    # Calculate when stale serving should stop (expiry + stale TTL)
     stale_serve_until_ts =
       expiry_ts + System.convert_time_unit(stale_ttl_ms, :millisecond, :native)
 
+    # Insert/update the cache entry
     :ets.insert(ets_table, {cache_key, value, expiry_ts, stale_serve_until_ts})
     Logger.debug("#{log_prefix} Updated cache.")
   end
 
-  # Helper for init options validation
+  # --- Private Validation Helper ---
+
+  # Helper for init options validation (ensures functions have correct arity)
   defp validate_fun!(opts, key, arity, signature) do
     fun = Keyword.get(opts, key)
 
-    if fun && !is_function(fun, arity) do
-      raise ArgumentError, "Option :#{key} must be a function with arity #{arity} #{signature}"
+    # Ensure the key exists and holds a function of the specified arity
+    unless is_function(fun, arity) do
+      # Raise a more informative error if the key is missing or not a function
+      cond do
+        is_nil(fun) ->
+          raise ArgumentError, "Required option :#{key} is missing."
+
+        not is_function(fun) ->
+          raise ArgumentError, "Option :#{key} (value: #{inspect(fun)}) must be a function."
+
+        true ->
+          # Arity mismatch
+          raise ArgumentError,
+                "Option :#{key} must be a function with arity #{arity} #{signature}, got function with arity #{Function.info(fun)[:arity]}."
+      end
     end
   end
 end
