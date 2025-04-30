@@ -4,7 +4,7 @@ defmodule ISRPlug.MixProject do
   def project do
     [
       app: :isr_plug,
-      version: "0.1.1",
+      version: "0.1.2",
       elixir: "~> 1.12",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
